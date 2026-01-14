@@ -338,8 +338,8 @@ func sortByTimestamp(entries []*pb.LogEntry) {
 // persistenceWorker batches and writes logs to GFS
 func (s *LogServer) persistenceWorker() {
 	const (
-		batchSize     = 1000
-		flushInterval = 1 * time.Minute
+		batchSize     = 100
+		flushInterval = 5 * time.Second
 		namespace     = "core-logs"
 	)
 
