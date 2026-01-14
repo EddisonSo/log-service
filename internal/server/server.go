@@ -12,7 +12,7 @@ import (
 	pb "github.com/eddisonso/log-service/proto/logging"
 )
 
-const bufferSize = 100
+const bufferSize = 1000
 
 // bufferKey creates a unique key for source+level combination
 func bufferKey(source string, level pb.LogLevel) string {
@@ -93,10 +93,11 @@ func NewLogServer(gfsClient *gfs.Client) *LogServer {
 		done:        make(chan struct{}),
 	}
 
-	// Start persistence worker if GFS is available
-	if gfsClient != nil {
-		go s.persistenceWorker()
-	}
+	// TODO: Re-enable persistence once concurrent write issues are resolved
+	// For now, logs are only streamed live and kept in ring buffers
+	// if gfsClient != nil {
+	// 	go s.persistenceWorker()
+	// }
 
 	return s
 }
