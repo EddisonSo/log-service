@@ -93,11 +93,10 @@ func NewLogServer(gfsClient *gfs.Client) *LogServer {
 		done:        make(chan struct{}),
 	}
 
-	// TODO: Re-enable persistence once concurrent write issues are resolved
-	// For now, logs are only streamed live and kept in ring buffers
-	// if gfsClient != nil {
-	// 	go s.persistenceWorker()
-	// }
+	// Start persistence worker if GFS client is configured
+	if gfsClient != nil {
+		go s.persistenceWorker()
+	}
 
 	return s
 }
