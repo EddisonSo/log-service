@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -289,9 +290,23 @@ func (s *LogServer) flushToGFS(ctx context.Context, source string, entries []*pb
 		buf.WriteByte('\n')
 	}
 
-	// Append to file
+	// Try to append to file
 	_, err := s.gfsClient.AppendWithNamespace(ctx, path, namespace, buf.Bytes())
 	if err != nil {
+		// If file doesn't exist, create it and retry
+		if strings.Contains(err.Error(), "file not found") {
+			_, createErr := s.gfsClient.CreateFileWithNamespace(ctx, path, namespace)
+			if createErr != nil {
+				slog.Error("failed to create log file", "path", path, "error", createErr)
+				return
+			}
+			// Retry append after creating file
+			_, err = s.gfsClient.AppendWithNamespace(ctx, path, namespace, buf.Bytes())
+			if err != nil {
+				slog.Error("failed to append logs to GFS after create", "source", source, "error", err)
+			}
+			return
+		}
 		slog.Error("failed to append logs to GFS", "source", source, "error", err)
 	}
 }
