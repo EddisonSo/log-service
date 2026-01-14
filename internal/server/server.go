@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -361,7 +360,7 @@ func (s *LogServer) persistenceWorker() {
 			groups[key] = append(groups[key], entry)
 		}
 
-		// Write each group to GFS
+		// Write each group to GFS (SDK auto-creates files if needed)
 		ctx := context.Background()
 		for path, entries := range groups {
 			var data []byte
@@ -374,21 +373,8 @@ func (s *LogServer) persistenceWorker() {
 				data = append(data, '\n')
 			}
 
-			_, err := s.gfsClient.AppendWithNamespace(ctx, path, namespace, data)
-			if err != nil {
-				// If file doesn't exist, create it and retry
-				if strings.Contains(err.Error(), "file not found") {
-					if _, createErr := s.gfsClient.CreateFileWithNamespace(ctx, path, namespace); createErr != nil {
-						slog.Warn("failed to create log file", "path", path, "error", createErr)
-						continue
-					}
-					// Retry append after creating
-					if _, err = s.gfsClient.AppendWithNamespace(ctx, path, namespace, data); err != nil {
-						slog.Warn("failed to persist logs after create", "path", path, "error", err)
-					}
-				} else {
-					slog.Warn("failed to persist logs", "path", path, "error", err)
-				}
+			if _, err := s.gfsClient.AppendWithNamespace(ctx, path, namespace, data); err != nil {
+				slog.Warn("failed to persist logs", "path", path, "error", err)
 			}
 		}
 
