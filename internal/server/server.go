@@ -248,7 +248,9 @@ func (s *LogServer) GetLogs(ctx context.Context, req *pb.GetLogsRequest) (*pb.Ge
 
 // Subscribe creates a channel for receiving log entries (used by WebSocket handler)
 func (s *LogServer) Subscribe(source string, minLevel pb.LogLevel) (<-chan *pb.LogEntry, func()) {
-	ch := make(chan *pb.LogEntry, 100)
+	// Large buffer to hold all initial entries without dropping
+	ch := make(chan *pb.LogEntry, 10000)
+	done := make(chan struct{})
 
 	s.subscribersMu.Lock()
 	s.subscribers[ch] = struct{}{}
@@ -258,6 +260,7 @@ func (s *LogServer) Subscribe(source string, minLevel pb.LogLevel) (<-chan *pb.L
 		s.subscribersMu.Lock()
 		delete(s.subscribers, ch)
 		s.subscribersMu.Unlock()
+		close(done)
 	}
 
 	// Send recent entries in background
@@ -266,8 +269,8 @@ func (s *LogServer) Subscribe(source string, minLevel pb.LogLevel) (<-chan *pb.L
 		for _, entry := range recent {
 			select {
 			case ch <- entry:
-			default:
-				// Channel full, skip
+			case <-done:
+				return // Subscriber disconnected
 			}
 		}
 	}()
