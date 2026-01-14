@@ -1,0 +1,46 @@
+syntax = "proto3";
+package logging;
+option go_package = "github.com/eddisonso/log-service/proto/logging";
+
+enum LogLevel {
+  DEBUG = 0;
+  INFO = 1;
+  WARN = 2;
+  ERROR = 3;
+}
+
+message LogEntry {
+  string source = 1;
+  LogLevel level = 2;
+  string message = 3;
+  int64 timestamp = 4;
+  map<string, string> attributes = 5;
+}
+
+message PushLogRequest {
+  LogEntry entry = 1;
+}
+
+message PushLogResponse {}
+
+message StreamLogsRequest {
+  string source = 1;
+  LogLevel min_level = 2;
+}
+
+message GetLogsRequest {
+  string source = 1;
+  LogLevel min_level = 2;
+  int64 since = 3;
+  int32 limit = 4;
+}
+
+message GetLogsResponse {
+  repeated LogEntry entries = 1;
+}
+
+service LogService {
+  rpc PushLog(PushLogRequest) returns (PushLogResponse);
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogEntry);
+  rpc GetLogs(GetLogsRequest) returns (GetLogsResponse);
+}
