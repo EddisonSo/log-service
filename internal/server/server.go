@@ -93,10 +93,11 @@ func NewLogServer(gfsClient *gfs.Client) *LogServer {
 		done:        make(chan struct{}),
 	}
 
-	// Start persistence worker if GFS client is configured
-	if gfsClient != nil {
-		go s.persistenceWorker()
-	}
+	// TODO: Persistence disabled - writes are failing and causing staged chunk expirations
+	// Need to investigate why AppendWithNamespace is failing before re-enabling
+	// if gfsClient != nil {
+	// 	go s.persistenceWorker()
+	// }
 
 	return s
 }
