@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	ringBufferSize = 1000
-	flushInterval  = 10 * time.Second
-	flushThreshold = 100
-	namespace      = "core-logging"
+	ringBufferSize     = 1000
+	flushInterval      = 30 * time.Second
+	flushBytesThreshold = 1 << 20 // 1MB
+	namespace          = "core-logging"
 )
 
 type LogServer struct {
@@ -31,8 +31,9 @@ type LogServer struct {
 	ringCount int
 
 	// Pending entries to flush to GFS
-	pending   []*pb.LogEntry
-	pendingMu sync.Mutex
+	pending      []*pb.LogEntry
+	pendingBytes int
+	pendingMu    sync.Mutex
 
 	// WebSocket subscribers
 	subscribers   map[chan *pb.LogEntry]struct{}
@@ -74,7 +75,9 @@ func (s *LogServer) PushLog(ctx context.Context, req *pb.PushLogRequest) (*pb.Pu
 	// Add to pending flush
 	s.pendingMu.Lock()
 	s.pending = append(s.pending, entry)
-	needsFlush := len(s.pending) >= flushThreshold
+	// Estimate size: message + source + ~50 bytes overhead for JSON
+	s.pendingBytes += len(entry.Message) + len(entry.Source) + 50
+	needsFlush := s.pendingBytes >= flushBytesThreshold
 	s.pendingMu.Unlock()
 
 	// Broadcast to subscribers
@@ -248,6 +251,7 @@ func (s *LogServer) flush() {
 	}
 	entries := s.pending
 	s.pending = nil
+	s.pendingBytes = 0
 	s.pendingMu.Unlock()
 
 	// Group by source
