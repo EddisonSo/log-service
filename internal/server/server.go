@@ -1,12 +1,10 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -14,31 +12,72 @@ import (
 	pb "github.com/eddisonso/log-service/proto/logging"
 )
 
-const (
-	ringBufferSize     = 1000
-	flushInterval      = 30 * time.Second
-	flushBytesThreshold = 1 << 20 // 1MB
-	namespace          = "core-logging"
-)
+const bufferSize = 100
+
+// bufferKey creates a unique key for source+level combination
+func bufferKey(source string, level pb.LogLevel) string {
+	return source + ":" + level.String()
+}
+
+// RingBuffer is a simple circular buffer for log entries
+type RingBuffer struct {
+	entries []*pb.LogEntry
+	head    int
+	count   int
+	mu      sync.RWMutex
+}
+
+func NewRingBuffer(size int) *RingBuffer {
+	return &RingBuffer{
+		entries: make([]*pb.LogEntry, size),
+	}
+}
+
+func (r *RingBuffer) Add(entry *pb.LogEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	idx := (r.head + r.count) % len(r.entries)
+	r.entries[idx] = entry
+	if r.count < len(r.entries) {
+		r.count++
+	} else {
+		r.head = (r.head + 1) % len(r.entries)
+	}
+}
+
+func (r *RingBuffer) GetAll() []*pb.LogEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make([]*pb.LogEntry, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		idx := (r.head + i) % len(r.entries)
+		result = append(result, r.entries[idx])
+	}
+	return result
+}
 
 type LogServer struct {
 	pb.UnimplementedLogServiceServer
 
-	gfsClient *gfs.Client
-	mu        sync.RWMutex
-	ringBuf   []*pb.LogEntry
-	ringHead  int
-	ringTail  int
-	ringCount int
+	// Per-source, per-level ring buffers
+	buffers   map[string]*RingBuffer
+	buffersMu sync.RWMutex
 
-	// Pending entries to flush to GFS
-	pending      []*pb.LogEntry
-	pendingBytes int
-	pendingMu    sync.Mutex
+	// Track known sources for enumeration
+	sources   map[string]struct{}
+	sourcesMu sync.RWMutex
 
 	// WebSocket subscribers
 	subscribers   map[chan *pb.LogEntry]struct{}
 	subscribersMu sync.RWMutex
+
+	// GFS client for persistence (optional)
+	gfsClient *gfs.Client
+
+	// Channel for async persistence
+	persistCh chan *pb.LogEntry
 
 	// For graceful shutdown
 	done chan struct{}
@@ -46,17 +85,68 @@ type LogServer struct {
 
 func NewLogServer(gfsClient *gfs.Client) *LogServer {
 	s := &LogServer{
-		gfsClient:   gfsClient,
-		ringBuf:     make([]*pb.LogEntry, ringBufferSize),
+		buffers:     make(map[string]*RingBuffer),
+		sources:     make(map[string]struct{}),
 		subscribers: make(map[chan *pb.LogEntry]struct{}),
+		gfsClient:   gfsClient,
+		persistCh:   make(chan *pb.LogEntry, 1000),
 		done:        make(chan struct{}),
 	}
-	go s.flushLoop()
+
+	// Start persistence worker if GFS is available
+	if gfsClient != nil {
+		go s.persistenceWorker()
+	}
+
 	return s
 }
 
 func (s *LogServer) Close() {
 	close(s.done)
+}
+
+// getOrCreateBuffer gets or creates a ring buffer for source+level
+func (s *LogServer) getOrCreateBuffer(source string, level pb.LogLevel) *RingBuffer {
+	key := bufferKey(source, level)
+
+	s.buffersMu.RLock()
+	buf, exists := s.buffers[key]
+	s.buffersMu.RUnlock()
+
+	if exists {
+		return buf
+	}
+
+	s.buffersMu.Lock()
+	defer s.buffersMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if buf, exists = s.buffers[key]; exists {
+		return buf
+	}
+
+	buf = NewRingBuffer(bufferSize)
+	s.buffers[key] = buf
+	return buf
+}
+
+// trackSource adds a source to the known sources set
+func (s *LogServer) trackSource(source string) {
+	s.sourcesMu.Lock()
+	s.sources[source] = struct{}{}
+	s.sourcesMu.Unlock()
+}
+
+// GetSources returns all known log sources
+func (s *LogServer) GetSources() []string {
+	s.sourcesMu.RLock()
+	defer s.sourcesMu.RUnlock()
+
+	result := make([]string, 0, len(s.sources))
+	for src := range s.sources {
+		result = append(result, src)
+	}
+	return result
 }
 
 // PushLog receives a log entry from a service
@@ -70,29 +160,29 @@ func (s *LogServer) PushLog(ctx context.Context, req *pb.PushLogRequest) (*pb.Pu
 		entry.Timestamp = time.Now().Unix()
 	}
 
-	// Add to ring buffer
-	s.addToRing(entry)
+	// Track source
+	s.trackSource(entry.Source)
 
-	// Add to pending flush
-	s.pendingMu.Lock()
-	s.pending = append(s.pending, entry)
-	// Estimate size: message + source + ~50 bytes overhead for JSON
-	s.pendingBytes += len(entry.Message) + len(entry.Source) + 50
-	needsFlush := s.pendingBytes >= flushBytesThreshold
-	s.pendingMu.Unlock()
+	// Add to appropriate ring buffer
+	buf := s.getOrCreateBuffer(entry.Source, entry.Level)
+	buf.Add(entry)
 
 	// Broadcast to subscribers
 	s.broadcast(entry)
 
-	// Trigger flush if threshold reached
-	if needsFlush {
-		go s.flush()
+	// Queue for persistence (non-blocking)
+	if s.gfsClient != nil {
+		select {
+		case s.persistCh <- entry:
+		default:
+			// Channel full, drop (logs are best-effort persisted)
+		}
 	}
 
 	return &pb.PushLogResponse{}, nil
 }
 
-// StreamLogs streams log entries to clients
+// StreamLogs streams log entries to clients (gRPC)
 func (s *LogServer) StreamLogs(req *pb.StreamLogsRequest, stream pb.LogService_StreamLogsServer) error {
 	ch := make(chan *pb.LogEntry, 100)
 
@@ -108,7 +198,7 @@ func (s *LogServer) StreamLogs(req *pb.StreamLogsRequest, stream pb.LogService_S
 		close(ch)
 	}()
 
-	// Send recent entries from ring buffer first
+	// Send recent entries from ring buffers first
 	recent := s.getRecentEntries(req.Source, req.MinLevel)
 	for _, entry := range recent {
 		if err := stream.Send(entry); err != nil {
@@ -136,8 +226,6 @@ func (s *LogServer) StreamLogs(req *pb.StreamLogsRequest, stream pb.LogService_S
 
 // GetLogs returns historical log entries
 func (s *LogServer) GetLogs(ctx context.Context, req *pb.GetLogsRequest) (*pb.GetLogsResponse, error) {
-	// For now, return from ring buffer
-	// TODO: Read from GFS for historical data
 	entries := s.getRecentEntries(req.Source, req.MinLevel)
 
 	// Apply since filter
@@ -173,13 +261,14 @@ func (s *LogServer) Subscribe(source string, minLevel pb.LogLevel) (<-chan *pb.L
 		s.subscribersMu.Unlock()
 	}
 
-	// Send recent entries
+	// Send recent entries in background
 	go func() {
 		recent := s.getRecentEntries(source, minLevel)
 		for _, entry := range recent {
 			select {
 			case ch <- entry:
 			default:
+				// Channel full, skip
 			}
 		}
 	}()
@@ -187,32 +276,26 @@ func (s *LogServer) Subscribe(source string, minLevel pb.LogLevel) (<-chan *pb.L
 	return ch, unsubscribe
 }
 
-func (s *LogServer) addToRing(entry *pb.LogEntry) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.ringBuf[s.ringTail] = entry
-	s.ringTail = (s.ringTail + 1) % ringBufferSize
-	if s.ringCount < ringBufferSize {
-		s.ringCount++
-	} else {
-		s.ringHead = (s.ringHead + 1) % ringBufferSize
-	}
-}
-
+// getRecentEntries retrieves entries from ring buffers matching the filter
 func (s *LogServer) getRecentEntries(source string, minLevel pb.LogLevel) []*pb.LogEntry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.buffersMu.RLock()
+	defer s.buffersMu.RUnlock()
 
-	entries := make([]*pb.LogEntry, 0, s.ringCount)
-	idx := s.ringHead
-	for i := 0; i < s.ringCount; i++ {
-		entry := s.ringBuf[idx]
-		if matchesFilter(entry, source, minLevel) {
-			entries = append(entries, entry)
+	var entries []*pb.LogEntry
+
+	// Collect from matching buffers
+	for _, buf := range s.buffers {
+		bufEntries := buf.GetAll()
+		for _, entry := range bufEntries {
+			if matchesFilter(entry, source, minLevel) {
+				entries = append(entries, entry)
+			}
 		}
-		idx = (idx + 1) % ringBufferSize
 	}
+
+	// Sort by timestamp
+	sortByTimestamp(entries)
+
 	return entries
 }
 
@@ -229,87 +312,6 @@ func (s *LogServer) broadcast(entry *pb.LogEntry) {
 	}
 }
 
-func (s *LogServer) flushLoop() {
-	ticker := time.NewTicker(flushInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.flush()
-		case <-s.done:
-			s.flush() // Final flush
-			return
-		}
-	}
-}
-
-func (s *LogServer) flush() {
-	s.pendingMu.Lock()
-	if len(s.pending) == 0 {
-		s.pendingMu.Unlock()
-		return
-	}
-	entries := s.pending
-	s.pending = nil
-	s.pendingBytes = 0
-	s.pendingMu.Unlock()
-
-	// Group by source
-	bySource := make(map[string][]*pb.LogEntry)
-	for _, e := range entries {
-		bySource[e.Source] = append(bySource[e.Source], e)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	for source, sourceEntries := range bySource {
-		s.flushToGFS(ctx, source, sourceEntries)
-	}
-}
-
-func (s *LogServer) flushToGFS(ctx context.Context, source string, entries []*pb.LogEntry) {
-	if s.gfsClient == nil || len(entries) == 0 {
-		return
-	}
-
-	// Single log file per source
-	path := fmt.Sprintf("/logs/%s.jsonl", source)
-
-	// Convert entries to JSONL
-	var buf bytes.Buffer
-	for _, e := range entries {
-		data, err := json.Marshal(e)
-		if err != nil {
-			slog.Error("failed to marshal log entry", "error", err)
-			continue
-		}
-		buf.Write(data)
-		buf.WriteByte('\n')
-	}
-
-	// Try to append to file
-	_, err := s.gfsClient.AppendWithNamespace(ctx, path, namespace, buf.Bytes())
-	if err != nil {
-		// If file doesn't exist, create it and retry
-		if strings.Contains(err.Error(), "file not found") {
-			_, createErr := s.gfsClient.CreateFileWithNamespace(ctx, path, namespace)
-			if createErr != nil {
-				slog.Error("failed to create log file", "path", path, "error", createErr)
-				return
-			}
-			// Retry append after creating file
-			_, err = s.gfsClient.AppendWithNamespace(ctx, path, namespace, buf.Bytes())
-			if err != nil {
-				slog.Error("failed to append logs to GFS after create", "source", source, "error", err)
-			}
-			return
-		}
-		slog.Error("failed to append logs to GFS", "source", source, "error", err)
-	}
-}
-
 func matchesFilter(entry *pb.LogEntry, source string, minLevel pb.LogLevel) bool {
 	if entry == nil {
 		return false
@@ -321,4 +323,76 @@ func matchesFilter(entry *pb.LogEntry, source string, minLevel pb.LogLevel) bool
 		return false
 	}
 	return true
+}
+
+// sortByTimestamp sorts entries by timestamp (oldest first)
+func sortByTimestamp(entries []*pb.LogEntry) {
+	// Simple insertion sort - entries are mostly sorted already
+	for i := 1; i < len(entries); i++ {
+		for j := i; j > 0 && entries[j].Timestamp < entries[j-1].Timestamp; j-- {
+			entries[j], entries[j-1] = entries[j-1], entries[j]
+		}
+	}
+}
+
+// persistenceWorker batches and writes logs to GFS
+func (s *LogServer) persistenceWorker() {
+	const (
+		batchSize     = 1000
+		flushInterval = 1 * time.Minute
+		namespace     = "core-logs"
+	)
+
+	batch := make([]*pb.LogEntry, 0, batchSize)
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		// Group by date and source for organized storage
+		groups := make(map[string][]*pb.LogEntry)
+		for _, entry := range batch {
+			t := time.Unix(entry.Timestamp, 0).UTC()
+			key := fmt.Sprintf("/%s/%s.jsonl", t.Format("2006-01-02"), entry.Source)
+			groups[key] = append(groups[key], entry)
+		}
+
+		// Write each group to GFS
+		ctx := context.Background()
+		for path, entries := range groups {
+			var data []byte
+			for _, entry := range entries {
+				line, err := json.Marshal(entry)
+				if err != nil {
+					continue
+				}
+				data = append(data, line...)
+				data = append(data, '\n')
+			}
+
+			if _, err := s.gfsClient.AppendWithNamespace(ctx, path, namespace, data); err != nil {
+				slog.Warn("failed to persist logs", "path", path, "error", err)
+			}
+		}
+
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case entry := <-s.persistCh:
+			batch = append(batch, entry)
+			if len(batch) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-s.done:
+			flush()
+			return
+		}
+	}
 }

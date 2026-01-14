@@ -34,14 +34,14 @@ func main() {
 	masterAddr := flag.String("master", "gfs-master:9000", "GFS master address")
 	flag.Parse()
 
-	// Connect to GFS
+	// Connect to GFS for log persistence
 	ctx := context.Background()
 	var gfsClient *gfs.Client
-	var err error
 
-	gfsClient, err = gfs.New(ctx, *masterAddr)
+	gfsClient, err := gfs.New(ctx, *masterAddr)
 	if err != nil {
 		slog.Warn("failed to connect to GFS master, logs will not be persisted", "error", err)
+		gfsClient = nil
 	} else {
 		slog.Info("connected to GFS master", "addr", *masterAddr)
 		defer gfsClient.Close()
@@ -176,7 +176,6 @@ func matchesFilter(entry *pb.LogEntry, source string, minLevel pb.LogLevel) bool
 		return false
 	}
 	if entry.Level < minLevel {
-		slog.Debug("filtering out log", "entryLevel", entry.Level, "minLevel", minLevel, "source", entry.Source)
 		return false
 	}
 	return true
