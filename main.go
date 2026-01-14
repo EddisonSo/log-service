@@ -123,6 +123,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, logServer *server.L
 		}
 	}
 
+	slog.Info("WebSocket client connected", "source", source, "level", levelStr, "minLevel", minLevel)
+
 	// Subscribe to logs
 	ch, unsubscribe := logServer.Subscribe(source, minLevel)
 	defer unsubscribe()
@@ -174,6 +176,7 @@ func matchesFilter(entry *pb.LogEntry, source string, minLevel pb.LogLevel) bool
 		return false
 	}
 	if entry.Level < minLevel {
+		slog.Debug("filtering out log", "entryLevel", entry.Level, "minLevel", minLevel, "source", entry.Source)
 		return false
 	}
 	return true
