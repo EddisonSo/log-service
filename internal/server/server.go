@@ -274,9 +274,8 @@ func (s *LogServer) flushToGFS(ctx context.Context, source string, entries []*pb
 		return
 	}
 
-	// Build path: {source}/{date}.jsonl
-	date := time.Now().Format("2006-01-02")
-	path := fmt.Sprintf("/%s/%s.jsonl", source, date)
+	// Single log file per source
+	path := fmt.Sprintf("/logs/%s.jsonl", source)
 
 	// Convert entries to JSONL
 	var buf bytes.Buffer
